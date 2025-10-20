@@ -8,12 +8,12 @@ TZ="${TZ:-Pacific/Auckland}"
 # MySQL bits
 MYSQL_DB="${MYSQL_DB:-keezer}"
 MYSQL_USER="${MYSQL_USER:-keezeruser}"
-MYSQL_PASS="${MYSQL_PASS:-ChangeMe_db}"
-MYSQL_ROOT_PASS="${MYSQL_ROOT_PASS:-ChangeMe_root}"
+MYSQL_PASS="${MYSQL_PASS:-password1}"
+MYSQL_ROOT_PASS="${MYSQL_ROOT_PASS:-password1}"
 
 # MQTT bits (Mosquitto)
 MQTT_USER="${MQTT_USER:-keezer}"
-MQTT_PASS="${MQTT_PASS:-ChangeMe_mqtt}"
+MQTT_PASS="${MQTT_PASS:-password}"
 
 # ==========================================
 
