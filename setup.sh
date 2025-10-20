@@ -16,6 +16,9 @@ MQTT_USER="${MQTT_USER:-keezer}"
 MQTT_PASS="${MQTT_PASS:-password1}"
 MOSQUITTO_IMAGE="${MOSQUITTO_IMAGE:-eclipse-mosquitto:2.0.18}"  # pinned; falls back to :2 if needed
 
+# Node-RED image (pin to a known-good tag instead of :latest)
+NODERED_IMAGE="${NODERED_IMAGE:-nodered/node-red:3.1.9}"
+
 # ==========================================
 
 log() { printf "%s\n" "$*" >&2; }
@@ -52,6 +55,10 @@ echo "[2/9] Create project layout at ${STACK_DIR}"
 mkdir -p "${STACK_DIR}"/{initdb,mosquitto,nodered}
 cd "${STACK_DIR}"
 
+# Ensure Node-RED data dir is writable by the container's default user (UID/GID 1000)
+# This prevents Node-RED from crash-looping with EACCES on /data.
+install -d -o 1000 -g 1000 -m 775 "${STACK_DIR}/nodered"
+
 echo "[3/9] Write .env"
 cat > .env <<EOF
 TZ=${TZ}
@@ -68,11 +75,12 @@ MQTT_PASSWORD=${MQTT_PASS}
 
 # Images
 MOSQUITTO_IMAGE=${MOSQUITTO_IMAGE}
+NODERED_IMAGE=${NODERED_IMAGE}
 EOF
 
 echo "[4/9] Write docker-compose.yml"
+# (Removed the obsolete 'version:' key to silence warnings)
 cat > docker-compose.yml <<'EOF'
-version: "3.8"
 services:
   mysql:
     image: mysql:8.0
@@ -91,7 +99,7 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p${MYSQL_ROOT_PASSWORD} --silent"]
       interval: 10s
-      timeout: 3s
+      timeout: 5s
       retries: 30
     restart: unless-stopped
 
@@ -105,10 +113,15 @@ services:
       - ./mosquitto/passwd:/mosquitto/config/passwd
       - mosq-data:/mosquitto/data
       - mosq-log:/mosquitto/log
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 1883 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
     restart: unless-stopped
 
   nodered:
-    image: nodered/node-red:latest
+    image: ${NODERED_IMAGE}
     container_name: keezer-nodered
     ports:
       - "1880:1880"
@@ -119,6 +132,11 @@ services:
     depends_on:
       - mosquitto
       - mysql
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "curl -fsS http://127.0.0.1:1880/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
     restart: unless-stopped
 
 volumes:
@@ -161,10 +179,12 @@ autosave_interval 180
 EOF
 
 # Ensure passwd file exists with strict perms so mosquitto can start even before we add a user.
+# (We will reset ownership to root:root again after adding the user to avoid the warning.)
 install -m 600 /dev/null mosquitto/passwd || true
 
 echo "[7/9] Pre-pull images with retry"
 docker compose pull || true
+
 # Extra resilience specifically for Mosquitto (Hub hiccups)
 if ! pull_with_retry "${MOSQUITTO_IMAGE}"; then
   log "[warn] Pull ${MOSQUITTO_IMAGE} failed; trying fallback tag ':2'..."
@@ -176,12 +196,17 @@ if ! pull_with_retry "${MOSQUITTO_IMAGE}"; then
   sed -i 's|image: ${MOSQUITTO_IMAGE}|image: eclipse-mosquitto:2|' docker-compose.yml
 fi
 
+# Also pre-pull Node-RED in case DNS/Hub is flaky
+pull_with_retry "${NODERED_IMAGE}" || true
+
 echo "[8/9] Bring services up"
 docker compose up -d
 
-# Wait for mosquitto container to be healthy/ready-ish
+# Wait a few seconds for containers to come up before we hit mosquitto_passwd
+sleep 3
+
 echo "[9/9] Create/Update MQTT user inside the running container"
-# Retry a few times in case the broker is still booting
+OK=0
 for i in 1 2 3 4 5; do
   if docker exec keezer-mqtt sh -c "mosquitto_passwd -b /mosquitto/config/passwd '${MQTT_USER}' '${MQTT_PASS}' && kill -HUP 1" ; then
     echo "  -> MQTT user '${MQTT_USER}' updated and broker reloaded"
@@ -191,9 +216,13 @@ for i in 1 2 3 4 5; do
   echo "  mosquitto not ready yet, retrying in 2s..."
   sleep 2
 done
-if [ "${OK:-0}" -ne 1 ]; then
+if [ "$OK" -ne 1 ]; then
   echo "  -> Could not set MQTT user automatically. You can run later:"
   echo "     docker exec -it keezer-mqtt mosquitto_passwd -b /mosquitto/config/passwd '${MQTT_USER}' '${MQTT_PASS}' && docker restart keezer-mqtt"
+else
+  # Silence the future warning: enforce root:root 600 on passwd, then restart to be safe
+  docker exec keezer-mqtt sh -c 'chown root:root /mosquitto/config/passwd && chmod 600 /mosquitto/config/passwd'
+  docker restart keezer-mqtt >/dev/null
 fi
 
 HOST_IP="$(hostname -I | awk '{print $1}')"
